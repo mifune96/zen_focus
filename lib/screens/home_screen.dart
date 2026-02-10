@@ -379,12 +379,10 @@ class _CircularTimer extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final minutes = timer.remaining.inMinutes
-        .remainder(60)
-        .toString()
-        .padLeft(2, '0');
+    final minutes = timer.remaining.inMinutes.toString().padLeft(2, '0');
     final seconds = timer.remaining.inSeconds
         .remainder(60)
+        .abs()
         .toString()
         .padLeft(2, '0');
 
