@@ -36,6 +36,7 @@ flutter:
 
   assets:
     - assets/audio/
+    - assets/images/
 
   # Bundled Inter font for offline-first, zero-network typography.
   # This ensures consistent rendering across all devices without
