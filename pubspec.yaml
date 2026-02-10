@@ -1,0 +1,57 @@
+name: zen_focus
+description: "Zen Focus - A minimalist Pomodoro-style focus timer."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.7
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State Management — Provider is lightweight, well-documented,
+  # and recommended by the Flutter team for simple apps.
+  provider: ^6.1.2
+
+  # Local Storage — shared_preferences is the standard solution
+  # for storing small key-value data without needing any
+  # dangerous permissions. Fully offline, no network calls.
+  shared_preferences: ^2.3.4
+
+  # Audio — audioplayers supports playing local asset audio
+  # without requiring any special permissions on Android/iOS.
+  audioplayers: ^6.1.0
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/audio/
+
+  # Bundled Inter font for offline-first, zero-network typography.
+  # This ensures consistent rendering across all devices without
+  # needing INTERNET permission.
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter-Thin.ttf
+          weight: 100
+        - asset: assets/fonts/Inter-Light.ttf
+          weight: 300
+        - asset: assets/fonts/Inter-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Inter-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Inter-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Inter-Bold.ttf
+          weight: 700
