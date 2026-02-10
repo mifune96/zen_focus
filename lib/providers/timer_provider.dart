@@ -6,36 +6,43 @@ import '../services/settings_service.dart';
 /// Possible states for the timer.
 enum TimerStatus { idle, running, paused, completed }
 
+/// Whether the current session is a focus or break period.
+enum SessionType { focus, breakTime }
+
 /// TimerProvider — the single source of truth for timer state.
 ///
 /// ### How this prevents ANR (App Not Responding) errors:
 ///
 /// 1. **No heavy work on the UI thread.** The only recurring work is a
 ///    1-second [Timer.periodic] callback that reads [DateTime.now()] and
-///    calls [notifyListeners()]. Both operations are O(1) and sub-microsecond.
+///    calls [notifyListeners()]. Both operations are O(1).
 ///
-/// 2. **Timestamp-based accuracy.** Instead of decrementing an integer
-///    every second (which drifts when the OS throttles the app), we store
-///    [_endTime] — the wall-clock time when the timer should finish.
-///    The remaining seconds are always computed as `_endTime - now`.
-///    This means:
-///    - If the app is backgrounded for 5 minutes, the timer will show
-///      the correct remaining time (or "completed") when resumed.
-///    - If the OS skips a periodic tick, the display catches up instantly.
+/// 2. **Timestamp-based accuracy.** We store [_endTime] — the wall-clock
+///    time when the timer should finish. Remaining seconds are always
+///    computed as `_endTime - now`. This stays accurate through backgrounding.
 ///
-/// 3. **Lifecycle-aware.** We implement [WidgetsBindingObserver] to
-///    recalculate remaining time when the app returns to the foreground
-///    and to persist elapsed focus time when the app goes to the background.
+/// 3. **Lifecycle-aware.** Implements [WidgetsBindingObserver] to
+///    recalculate remaining time when the app returns to foreground.
 ///
 /// 4. **Audio playback is asynchronous.** The [AudioPlayer] plays the
 ///    chime on a platform thread; it never blocks the Dart isolate.
+///
+/// 5. **Timer state persisted.** When the timer is running, the endTime
+///    is saved to SharedPreferences. If the app is killed and reopened,
+///    the timer resumes from where it was.
 class TimerProvider extends ChangeNotifier with WidgetsBindingObserver {
   final SettingsService _settings;
 
   TimerProvider(this._settings) {
-    _totalDuration = Duration(minutes: _settings.getTimerDurationMinutes());
+    _focusDuration = Duration(minutes: _settings.getTimerDurationMinutes());
+    _breakDuration = Duration(minutes: _settings.getBreakDurationMinutes());
+    _totalDuration = _focusDuration;
     _remaining = _totalDuration;
+    _completedPomodoros = _settings.getCompletedPomodorosToday();
     WidgetsBinding.instance.addObserver(this);
+
+    // Restore timer state if the app was killed while timer was running.
+    _restoreTimerState();
   }
 
   // ───────────────────── State Fields ─────────────────────
@@ -43,17 +50,34 @@ class TimerProvider extends ChangeNotifier with WidgetsBindingObserver {
   TimerStatus _status = TimerStatus.idle;
   TimerStatus get status => _status;
 
+  SessionType _sessionType = SessionType.focus;
+  SessionType get sessionType => _sessionType;
+
+  Duration _focusDuration = const Duration(minutes: 25);
+  Duration _breakDuration = const Duration(minutes: 5);
+
   Duration _totalDuration = const Duration(minutes: 25);
   Duration get totalDuration => _totalDuration;
 
   Duration _remaining = const Duration(minutes: 25);
   Duration get remaining => _remaining;
 
+  int _completedPomodoros = 0;
+  int get completedPomodoros => _completedPomodoros;
+
+  /// Optional label for the current focus session.
+  String _sessionLabel = '';
+  String get sessionLabel => _sessionLabel;
+
   /// Progress from 0.0 (just started) to 1.0 (complete).
   double get progress {
     if (_totalDuration.inSeconds == 0) return 1.0;
     return 1.0 - (_remaining.inSeconds / _totalDuration.inSeconds);
   }
+
+  /// Whether the timer is actively counting (running or paused).
+  bool get isActive =>
+      _status == TimerStatus.running || _status == TimerStatus.paused;
 
   /// Wall-clock time when the running timer should reach zero.
   DateTime? _endTime;
@@ -64,14 +88,118 @@ class TimerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// Audio player for the completion chime.
   final AudioPlayer _audioPlayer = AudioPlayer();
 
+  // ───────────────────── State Persistence ─────────────────────
+
+  /// Saves the current timer state to SharedPreferences so it survives
+  /// app kills. Only saves when the timer is actively running.
+  void _saveTimerState() {
+    if (_endTime != null && _status == TimerStatus.running) {
+      _settings.saveTimerState(
+        endTimeIso: _endTime!.toIso8601String(),
+        totalDurationSeconds: _totalDuration.inSeconds,
+        sessionType: _sessionType == SessionType.focus ? 'focus' : 'break',
+        sessionLabel: _sessionLabel,
+      );
+    } else {
+      _settings.clearTimerState();
+    }
+  }
+
+  /// Restores timer state from SharedPreferences. Called once during init.
+  void _restoreTimerState() {
+    final saved = _settings.getSavedTimerState();
+    if (saved == null) return;
+
+    final endTimeIso = saved['endTime'] as String?;
+    final totalSec = saved['totalDurationSeconds'] as int?;
+    final sessionTypeStr = saved['sessionType'] as String?;
+    final label = saved['sessionLabel'] as String?;
+
+    if (endTimeIso == null || totalSec == null) {
+      _settings.clearTimerState();
+      return;
+    }
+
+    final endTime = DateTime.tryParse(endTimeIso);
+    if (endTime == null) {
+      _settings.clearTimerState();
+      return;
+    }
+
+    final now = DateTime.now();
+    final diff = endTime.difference(now);
+
+    _totalDuration = Duration(seconds: totalSec);
+    _sessionType = sessionTypeStr == 'break'
+        ? SessionType.breakTime
+        : SessionType.focus;
+    _sessionLabel = label ?? '';
+
+    if (diff.isNegative || diff.inSeconds <= 0) {
+      // Timer already completed while app was closed.
+      _remaining = Duration.zero;
+      _status = TimerStatus.completed;
+
+      if (_sessionType == SessionType.focus) {
+        _settings.addFocusTime(_totalDuration.inSeconds);
+        _settings.incrementCompletedPomodoros();
+        _settings.recordSession(
+          durationMinutes: _totalDuration.inMinutes,
+          type: 'focus',
+          label: _sessionLabel,
+        );
+        _completedPomodoros++;
+      } else {
+        _settings.recordSession(
+          durationMinutes: _totalDuration.inMinutes,
+          type: 'break',
+        );
+      }
+
+      if (_settings.getSoundEnabled()) {
+        _playChime();
+      }
+
+      _settings.clearTimerState();
+      notifyListeners();
+    } else {
+      // Timer still has time left — resume it.
+      _endTime = endTime;
+      _remaining = diff;
+      _status = TimerStatus.running;
+      _startTicker();
+      notifyListeners();
+    }
+  }
+
   // ───────────────────── Public API ─────────────────────
 
-  /// Sets a new duration (in minutes). Only allowed when idle.
-  void setDuration(int minutes) {
+  /// Sets the focus duration (in minutes). Only allowed when idle.
+  void setFocusDuration(int minutes) {
     if (_status != TimerStatus.idle) return;
-    _totalDuration = Duration(minutes: minutes);
-    _remaining = _totalDuration;
+    _focusDuration = Duration(minutes: minutes);
+    if (_sessionType == SessionType.focus) {
+      _totalDuration = _focusDuration;
+      _remaining = _totalDuration;
+    }
     _settings.setTimerDurationMinutes(minutes);
+    notifyListeners();
+  }
+
+  /// Sets the break duration (in minutes).
+  void setBreakDuration(int minutes) {
+    _breakDuration = Duration(minutes: minutes);
+    if (_sessionType == SessionType.breakTime && _status == TimerStatus.idle) {
+      _totalDuration = _breakDuration;
+      _remaining = _totalDuration;
+    }
+    _settings.setBreakDurationMinutes(minutes);
+    notifyListeners();
+  }
+
+  /// Sets a label for the current session.
+  void setSessionLabel(String label) {
+    _sessionLabel = label;
     notifyListeners();
   }
 
@@ -79,11 +207,11 @@ class TimerProvider extends ChangeNotifier with WidgetsBindingObserver {
   void start() {
     if (_status == TimerStatus.running) return;
 
-    // Calculate the absolute end time from the remaining duration.
     _endTime = DateTime.now().add(_remaining);
     _status = TimerStatus.running;
 
     _startTicker();
+    _saveTimerState(); // Persist so timer survives app kill.
     notifyListeners();
   }
 
@@ -92,21 +220,22 @@ class TimerProvider extends ChangeNotifier with WidgetsBindingObserver {
     if (_status != TimerStatus.running) return;
 
     _ticker?.cancel();
-    // Snapshot the remaining time so we don't lose precision.
     _remaining = _endTime!.difference(DateTime.now());
     if (_remaining.isNegative) _remaining = Duration.zero;
 
     _endTime = null;
     _status = TimerStatus.paused;
+    _saveTimerState(); // Clear persisted running state.
     notifyListeners();
   }
 
-  /// Resets the timer back to idle with the full duration.
+  /// Resets the timer back to idle with the focus duration.
   void reset() {
     _ticker?.cancel();
 
-    // If the timer was running or paused, save elapsed focus time.
-    if (_status == TimerStatus.running || _status == TimerStatus.paused) {
+    // Save any elapsed focus time.
+    if ((_status == TimerStatus.running || _status == TimerStatus.paused) &&
+        _sessionType == SessionType.focus) {
       final elapsed = _totalDuration.inSeconds - _remaining.inSeconds;
       if (elapsed > 0) {
         _settings.addFocusTime(elapsed);
@@ -114,17 +243,56 @@ class TimerProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     _endTime = null;
-    _status = TimerStatus.idle;
+    _sessionType = SessionType.focus;
+    _totalDuration = _focusDuration;
     _remaining = _totalDuration;
+    _status = TimerStatus.idle;
+    _sessionLabel = '';
+    _settings.clearTimerState(); // Clear persisted state.
     notifyListeners();
+  }
+
+  /// Skips the current session (break or focus) and moves to the next phase.
+  void skipToNext() {
+    _ticker?.cancel();
+    _settings.clearTimerState();
+
+    if (_sessionType == SessionType.focus) {
+      _startBreakSession();
+    } else {
+      _startFocusIdle();
+    }
+  }
+
+  /// Starts the break session after a completed focus session.
+  void startBreak() {
+    _startBreakSession();
+    start(); // Auto-start the break timer.
   }
 
   // ───────────────────── Internal Logic ─────────────────────
 
+  void _startBreakSession() {
+    _sessionType = SessionType.breakTime;
+    _totalDuration = _breakDuration;
+    _remaining = _breakDuration;
+    _status = TimerStatus.idle;
+    _endTime = null;
+    notifyListeners();
+  }
+
+  void _startFocusIdle() {
+    _sessionType = SessionType.focus;
+    _totalDuration = _focusDuration;
+    _remaining = _focusDuration;
+    _status = TimerStatus.idle;
+    _endTime = null;
+    _sessionLabel = '';
+    notifyListeners();
+  }
+
   void _startTicker() {
     _ticker?.cancel();
-    // A 1-second periodic timer is cheap — it only triggers a DateTime
-    // comparison and a notifyListeners() call, both O(1).
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       _tick();
     });
@@ -142,12 +310,27 @@ class TimerProvider extends ChangeNotifier with WidgetsBindingObserver {
       _ticker?.cancel();
       _status = TimerStatus.completed;
 
-      // Save the full session as focus time.
-      _settings.addFocusTime(_totalDuration.inSeconds);
+      if (_sessionType == SessionType.focus) {
+        _settings.addFocusTime(_totalDuration.inSeconds);
+        _settings.incrementCompletedPomodoros();
+        _settings.recordSession(
+          durationMinutes: _totalDuration.inMinutes,
+          type: 'focus',
+          label: _sessionLabel,
+        );
+        _completedPomodoros++;
+      } else {
+        _settings.recordSession(
+          durationMinutes: _totalDuration.inMinutes,
+          type: 'break',
+        );
+      }
 
-      // Play the completion chime asynchronously — will not block the UI.
-      _playChime();
+      if (_settings.getSoundEnabled()) {
+        _playChime();
+      }
 
+      _settings.clearTimerState(); // Timer done, clear persisted state.
       notifyListeners();
     } else {
       _remaining = diff;
@@ -159,23 +342,12 @@ class TimerProvider extends ChangeNotifier with WidgetsBindingObserver {
     try {
       await _audioPlayer.play(AssetSource('audio/chime.wav'));
     } catch (e) {
-      // Silently ignore audio errors — the timer is still functional.
       debugPrint('Zen Focus: Could not play chime — $e');
     }
   }
 
   // ───────────────────── Lifecycle Handling ─────────────────────
 
-  /// Called by the system when the app lifecycle changes.
-  ///
-  /// When the app goes to background ([AppLifecycleState.paused]):
-  ///   - We cancel the periodic ticker to save battery.
-  ///   - We keep [_endTime] so we can recalculate on resume.
-  ///
-  /// When the app returns to foreground ([AppLifecycleState.resumed]):
-  ///   - We recalculate [_remaining] from [_endTime] — this gives us
-  ///     accurate time even if the app was backgrounded for minutes/hours.
-  ///   - We restart the ticker.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (_status != TimerStatus.running) return;
@@ -185,14 +357,13 @@ class TimerProvider extends ChangeNotifier with WidgetsBindingObserver {
       case AppLifecycleState.inactive:
       case AppLifecycleState.detached:
       case AppLifecycleState.hidden:
-        // App going to background — stop the ticker to save resources.
         _ticker?.cancel();
+        _saveTimerState(); // Save state before going to background.
         break;
       case AppLifecycleState.resumed:
-        // App returning to foreground — recalculate from wall-clock time.
-        _tick(); // Immediately sync remaining time.
+        _tick();
         if (_status == TimerStatus.running) {
-          _startTicker(); // Restart the periodic UI refresh.
+          _startTicker();
         }
         break;
     }

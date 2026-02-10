@@ -8,3 +8,6 @@
 
 # Don't warn about missing annotations
 -dontwarn javax.annotation.**
+
+# Play Core (deferred components) — not used but referenced by Flutter engine
+-dontwarn com.google.android.play.core.**
